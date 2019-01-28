@@ -1,0 +1,185 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'base64'
+require 'optparse'
+require 'bundler/inline'
+
+$options = {}
+OptionParser.new do |opts|
+  opts.on("--browser BROWSER", [:firefox, :chrome], "The browser") do |browser|
+    $options[:browser] = browser
+  end
+
+  opts.on("--browser-profile [BROWSER_PROFILE]", "The browser profile (firefox default: default / chrome default: your OS default)") do |browser_profile|
+    $options[:browser_profile] = browser_profile
+  end
+
+  opts.on("--idpid IDPID",  "The SAML IDPID") do |idpid|
+    $options[:idpid] = idpid
+  end
+
+  opts.on("--spid SPID",  "The SAML SPID") do |spid|
+    $options[:spid] = spid
+  end
+
+  opts.on("--aws-region AWS_REGION",  "The AWS region") do |aws_region|
+    $options[:aws_region] = aws_region
+  end
+
+  opts.on("--aws-arn AWS_ARN",  "The AWS ARN (performs a partial match)") do |aws_arn|
+    $options[:aws_arn] = aws_arn
+  end
+
+  opts.on("--aws-cli-profile [AWS_CLI_PROFILE]",  "The AWS CLI profile (default: default)") do |aws_cli_profile|
+    $options[:aws_cli_profile] = aws_cli_profile
+  end
+
+  opts.on("--google-email [GOOLE_EMAIL]",  "The google email, necessary when you have multiple accounts") do |google_email|
+    $options[:google_email] = google_email
+  end
+
+  opts.on_tail("-h", "--help", "Prints this help") do
+    $stderr.puts opts
+    exit
+  end
+end.parse(ARGV.dup.tap { |args| args << '-h' if args.empty? })
+
+$stderr.puts "Fetching dependencies..."
+gemfile do
+  source 'https://rubygems.org'
+
+  gem 'selenium-webdriver'
+  gem 'aws-sdk'
+  gem 'parseconfig'
+  gem 'ruby-saml', git: 'https://github.com/onelogin/ruby-saml.git'
+  gem 'pry-byebug'
+end
+
+AWS_ROLE_URI = 'https://aws.amazon.com/SAML/Attributes/Role'
+AWS_CONFIG_FILE = Dir.home + '/.aws/config'
+AWS_CREDENTIALS_FILE = Dir.home + '/.aws/credentials'
+
+def generate_saml_url(idpid:, spid:)
+  "https://accounts.google.com/o/saml2/initsso?idpid=#{idpid}&spid=#{spid}&forceauthn=false".freeze
+end
+
+def find_element(driver, *args)
+  driver.find_element(*args)
+rescue Selenium::WebDriver::Error::NoSuchElementError
+  nil
+end
+
+def get_saml_assertion(saml_url:, browser_profile: nil, browser:, google_email: nil)
+  driver_options =
+    case browser
+    when :firefox
+      $stderr.puts "Using Firefox..."
+      Selenium::WebDriver::Firefox::Options.new.tap do |opts|
+        browser_profile ||= 'default'
+        opts.profile = browser_profile
+        opts.add_argument('-headless')
+      end
+    when :chrome
+      $stderr.puts "Using Chrome..."
+      Selenium::WebDriver::Chrome::Options.new.tap do |opts|
+        browser_profile ||=
+          case RUBY_PLATFORM
+          when /darwin/
+            "#{Dir.home}/Library/Application Support/Google/Chrome/"
+          when /linux/
+            "#{Dir.home}/.config/google-chrome/"
+          else
+            $stderr.puts "Unsupported ruby platform: #{RUBY_PLATFORM}"
+            exit(1)
+          end
+        opts.add_argument('--disable-extensions')
+        opts.add_argument("--user-data-dir=#{browser_profile}")
+      end
+    else
+      $stderr.puts "Browser #{browser} isn't supported (supported: firefox and chrome)"
+      exit(1)
+    end
+
+  driver = Selenium::WebDriver.for(browser, options: driver_options)
+  at_exit { driver.quit }
+  driver.navigate.to(saml_url)
+  # hacky, select google account
+  if find_element(driver, :xpath, "//*[contains(text(), 'Choose an account')]")
+    if google_email.nil?
+      $stderr.puts "You have multiple google email accounts. Specify which one you want to use."
+      exit(1)
+    end
+    find_element(driver, :css, "[value='#{google_email}']")&.click
+  end
+  saml_assertion = find_element(driver, :css, "[name='SAMLResponse']")&.attribute('value')
+
+  if saml_assertion.nil?
+    $stderr.puts "Couldn't find the SAML assertion on #{saml_url} with #{browser} (profile: #{browser_profile})"
+    exit(1)
+  end
+
+  $stderr.puts "SAML assertion acquired!"
+  saml_assertion
+end
+
+def get_arns(saml_assertion:, aws_arn:)
+  saml_response = OneLogin::RubySaml::Response.new(Base64.decode64(saml_assertion))
+  full_arn = saml_response.attributes.multi(AWS_ROLE_URI).find { |arn| arn.include?(aws_arn) }
+  if full_arn.nil?
+    $stdout.puts "ARN #{aws_arn} is invalid. The ARNs found are:"
+    saml_response.attributes.each { |attr| $stdout.puts attr }
+    exit(1)
+  end
+  role_arn, principal_arn = full_arn.split(',')
+end
+
+def get_sts_token(role_arn:, principal_arn:, saml_assertion:, aws_region:)
+  sts = Aws::STS::Client.new(region: aws_region)
+  sts.assume_role_with_saml(role_arn: role_arn,
+                            principal_arn: principal_arn,
+                            saml_assertion: saml_assertion)
+end
+
+def generate_aws_cli_config(sts_token:, aws_cli_profile:, aws_region:)
+  group_name = aws_cli_profile == 'default' ? aws_cli_profile : "profile #{aws_cli_profile}"
+  config = ParseConfig.new(AWS_CONFIG_FILE)
+  config.add_to_group(group_name, 'region', aws_region)
+  config.add_to_group(group_name, 'output', 'json')
+  File.open(AWS_CONFIG_FILE, 'w') { |f| config.write(f, false) }
+  true
+end
+
+def generate_aws_cli_credentials(sts_token:, aws_cli_profile:)
+  credentials = ParseConfig.new(AWS_CREDENTIALS_FILE)
+  credentials.add_to_group(aws_cli_profile, 'aws_access_key_id', sts_token.credentials.access_key_id)
+  credentials.add_to_group(aws_cli_profile, 'aws_secret_access_key', sts_token.credentials.secret_access_key)
+  credentials.add_to_group(aws_cli_profile, 'aws_session_token', sts_token.credentials.session_token)
+  File.open(AWS_CREDENTIALS_FILE, 'w') { |f| credentials.write(f, false) }
+  true
+end
+
+def setup_aws_cli(sts_token:, aws_cli_profile:, aws_region:)
+  $stderr.puts "Updating config and credentials..."
+  generate_aws_cli_config(sts_token: sts_token, aws_cli_profile: aws_cli_profile, aws_region: aws_region) &&
+    generate_aws_cli_credentials(sts_token: sts_token, aws_cli_profile: aws_cli_profile)
+end
+
+###############################################################################
+# Steps
+
+saml_url = generate_saml_url(spid: $options[:spid], idpid: $options[:idpid])
+saml_assertion = get_saml_assertion(saml_url: saml_url,
+                                    browser: $options[:browser],
+                                    browser_profile: $options[:browser_profile],
+                                    google_email: $options[:google_email])
+role_arn, principal_arn = get_arns(saml_assertion: saml_assertion, aws_arn: $options[:aws_arn])
+sts_token = get_sts_token(saml_assertion: saml_assertion,
+                          role_arn: role_arn,
+                          principal_arn: principal_arn,
+                          aws_region: $options[:aws_region])
+setup_aws_cli(sts_token: sts_token,
+              aws_cli_profile: $options[:aws_cli_profile] || 'default',
+              aws_region: $options[:aws_region])
+
+$stderr.puts "Success!"
