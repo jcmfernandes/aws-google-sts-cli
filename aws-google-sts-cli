@@ -7,7 +7,7 @@ require 'bundler/inline'
 
 $options = {}
 OptionParser.new do |opts|
-  opts.on("--browser BROWSER", [:firefox, :chrome], "The browser") do |browser|
+  opts.on("--browser BROWSER", [:firefox, :chrome], "The browser (chrome or firefox)") do |browser|
     $options[:browser] = browser
   end
 
