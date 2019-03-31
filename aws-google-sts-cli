@@ -128,7 +128,7 @@ def get_arns(saml_assertion:, aws_arn:)
   full_arn = saml_response.attributes.multi(AWS_ROLE_URI).find { |arn| arn.include?(aws_arn) }
   if full_arn.nil?
     $stdout.puts "ARN #{aws_arn} is invalid. The ARNs found are:"
-    saml_response.attributes.each { |attr| $stdout.puts attr }
+    saml_response.attributes.multi(AWS_ROLE_URI).each { |attr| $stdout.puts attr }
     exit(1)
   end
   role_arn, principal_arn = full_arn.split(',')
