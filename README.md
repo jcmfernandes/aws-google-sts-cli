@@ -33,3 +33,7 @@ Usage: aws-google-sts-cli [options]
         --google-email [GOOLE_EMAIL] The google email, necessary when you have multiple accounts
     -h, --help                       Prints this help
 ```
+
+## Known Issues
+
+* Chrome support is fairly weak at this point (yes, I'm a Firefox user). Sometimes it works, sometimes it doesn't. It seems like Chrome is always launched with a separate profile. And I was never able to make it work in headless mode. PRs are welcome!
