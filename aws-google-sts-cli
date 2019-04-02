@@ -57,10 +57,10 @@ gemfile do
   source 'https://rubygems.org'
 
   gem 'selenium-webdriver'
-  gem 'aws-sdk'
+  gem 'aws-sdk-core'
   gem 'parseconfig'
   gem 'ruby-saml', git: 'https://github.com/onelogin/ruby-saml.git'
-  gem 'pry-byebug'
+  gem 'pry-byebug' if ENV['APP_ENV']
 end
 
 AWS_ROLE_URI = 'https://aws.amazon.com/SAML/Attributes/Role'
